@@ -24,16 +24,16 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
-	schedulerconfig "k8s.io/kube-scheduler/config/v1"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 
-	"sigs.k8s.io/scheduler-plugins/pkg/apis/config"
+	"sigs.k8s.io/scheduler-plugins/apis/config"
 )
 
 // Allocatable is a score plugin that favors nodes based on their allocatable
 // resources.
 type Allocatable struct {
-	handle framework.FrameworkHandle
+	handle framework.Handle
 	resourceAllocationScorer
 }
 
@@ -77,7 +77,7 @@ func (alloc *Allocatable) ScoreExtensions() framework.ScoreExtensions {
 }
 
 // NewAllocatable initializes a new plugin and returns it.
-func NewAllocatable(allocArgs runtime.Object, h framework.FrameworkHandle) (framework.Plugin, error) {
+func NewAllocatable(allocArgs runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	// Start with default values.
 	mode := config.Least
 	resToWeightMap := defaultResourcesToWeightMap
@@ -117,8 +117,8 @@ func NewAllocatable(allocArgs runtime.Object, h framework.FrameworkHandle) (fram
 	}, nil
 }
 
-func resourceScorer(resToWeightMap resourceToWeightMap, mode config.ModeType) func(resourceToValueMap, resourceToValueMap, bool, int, int) int64 {
-	return func(requested, allocable resourceToValueMap, includeVolumes bool, requestedVolumes int, allocatableVolumes int) int64 {
+func resourceScorer(resToWeightMap resourceToWeightMap, mode config.ModeType) func(resourceToValueMap, resourceToValueMap) int64 {
+	return func(requested, allocable resourceToValueMap) int64 {
 		// TODO: consider volumes in scoring.
 		var nodeScore, weightSum int64
 		for resource, weight := range resToWeightMap {
@@ -131,14 +131,14 @@ func resourceScorer(resToWeightMap resourceToWeightMap, mode config.ModeType) fu
 }
 
 func score(capacity int64, mode config.ModeType) int64 {
-	switch config.ModeType(mode) {
+	switch mode {
 	case config.Least:
 		return -1 * capacity
 	case config.Most:
 		return capacity
 	}
 
-	klog.V(10).Infoln("No match for mode: ", mode)
+	klog.V(10).InfoS("No match for mode", "mode", mode)
 	return 0
 }
 

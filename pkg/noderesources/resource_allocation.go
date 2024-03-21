@@ -21,11 +21,8 @@ package noderesources
 
 import (
 	v1 "k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
-	"k8s.io/kubernetes/pkg/features"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
 
@@ -41,7 +38,7 @@ var defaultResourcesToWeightMap = resourceToWeightMap{v1.ResourceMemory: 1, v1.R
 // resourceAllocationScorer contains information to calculate resource allocation score.
 type resourceAllocationScorer struct {
 	Name                string
-	scorer              func(requested, allocatable resourceToValueMap, includeVolumes bool, requestedVolumes int, allocatableVolumes int) int64
+	scorer              func(requested, allocatable resourceToValueMap) int64
 	resourceToWeightMap resourceToWeightMap
 }
 
@@ -64,31 +61,14 @@ func (r *resourceAllocationScorer) score(
 	for resource := range r.resourceToWeightMap {
 		allocatable[resource], requested[resource] = calculateResourceAllocatableRequest(nodeInfo, pod, resource)
 	}
-	var score int64
 
-	// Check if the pod has volumes and this could be added to scorer function for balanced resource allocation.
-	if len(pod.Spec.Volumes) >= 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
-		score = r.scorer(requested, allocatable, true, nodeInfo.TransientInfo.TransNodeInfo.RequestedVolumes, nodeInfo.TransientInfo.TransNodeInfo.AllocatableVolumesCount)
-	} else {
-		score = r.scorer(requested, allocatable, false, 0, 0)
-	}
+	score := r.scorer(requested, allocatable)
+
 	if klog.V(10).Enabled() {
-		if len(pod.Spec.Volumes) >= 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
-			klog.Infof(
-				"%v -> %v: %v, map of allocatable resources %v, map of requested resources %v , allocatable volumes %d, requested volumes %d, score %d",
-				pod.Name, node.Name, r.Name,
-				allocatable, requested, nodeInfo.TransientInfo.TransNodeInfo.AllocatableVolumesCount,
-				nodeInfo.TransientInfo.TransNodeInfo.RequestedVolumes,
-				score,
-			)
-		} else {
-			klog.Infof(
-				"%v -> %v: %v, map of allocatable resources %v, map of requested resources %v ,score %d,",
-				pod.Name, node.Name, r.Name,
-				allocatable, requested, score,
-			)
-
-		}
+		klog.InfoS("Resources and score",
+			"podName", pod.Name, "nodeName", node.Name, "scorer", r.Name,
+			"allocatableResources", allocatable, "requestedResources", requested,
+			"score", score)
 	}
 
 	return score, nil
@@ -106,13 +86,13 @@ func calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.P
 	case v1.ResourceEphemeralStorage:
 		return nodeInfo.Allocatable.EphemeralStorage, (nodeInfo.Requested.EphemeralStorage + podRequest)
 	default:
-		if v1helper.IsScalarResourceName(resource) {
+		if schedutil.IsScalarResourceName(resource) {
 			return nodeInfo.Allocatable.ScalarResources[resource], (nodeInfo.Requested.ScalarResources[resource] + podRequest)
 		}
 	}
 	if klog.V(10).Enabled() {
-		klog.Infof("requested resource %v not considered for node score calculation",
-			resource,
+		klog.InfoS("Requested resource not considered for node score calculation",
+			"resource", resource,
 		)
 	}
 	return 0, 0
@@ -125,20 +105,20 @@ func calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	var podRequest int64
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
-		value := schedutil.GetNonzeroRequestForResource(resource, &container.Resources.Requests)
-		podRequest += value
+		qty := schedutil.GetRequestForResource(resource, &container.Resources.Requests, true)
+		podRequest += qty.Value()
 	}
 
 	for i := range pod.Spec.InitContainers {
 		initContainer := &pod.Spec.InitContainers[i]
-		value := schedutil.GetNonzeroRequestForResource(resource, &initContainer.Resources.Requests)
-		if podRequest < value {
+		qty := schedutil.GetRequestForResource(resource, &initContainer.Resources.Requests, true)
+		if value := qty.Value(); podRequest < value {
 			podRequest = value
 		}
 	}
 
 	// If Overhead is being utilized, add to the total requests for the pod
-	if pod.Spec.Overhead != nil && utilfeature.DefaultFeatureGate.Enabled(features.PodOverhead) {
+	if pod.Spec.Overhead != nil {
 		if quantity, found := pod.Spec.Overhead[resource]; found {
 			podRequest += quantity.Value()
 		}

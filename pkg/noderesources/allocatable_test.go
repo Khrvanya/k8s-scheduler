@@ -26,15 +26,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
-	schedulerconfig "k8s.io/kube-scheduler/config/v1"
+	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	fakeframework "k8s.io/kubernetes/pkg/scheduler/framework/fake"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	fakeframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1/fake"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 
-	"sigs.k8s.io/scheduler-plugins/pkg/apis/config"
+	"sigs.k8s.io/scheduler-plugins/apis/config"
 )
 
 func TestNodeResourcesAllocatable(t *testing.T) {
@@ -237,6 +237,9 @@ func TestNodeResourcesAllocatable(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
 			cs := clientsetfake.NewSimpleClientset()
 			informerFactory := informers.NewSharedInformerFactory(cs, 0)
 			podInformer := informerFactory.Core().V1().Pods().Informer()
@@ -251,7 +254,9 @@ func TestNodeResourcesAllocatable(t *testing.T) {
 			fakeSharedLister := &fakeSharedLister{nodes: test.nodeInfos}
 
 			fh, err := st.NewFramework(
+				ctx,
 				registeredPlugins,
+				"default-scheduler",
 				frameworkruntime.WithClientSet(cs),
 				frameworkruntime.WithInformerFactory(informerFactory),
 				frameworkruntime.WithSnapshotSharedLister(fakeSharedLister),
@@ -339,6 +344,10 @@ var _ framework.SharedLister = &fakeSharedLister{}
 
 type fakeSharedLister struct {
 	nodes []*framework.NodeInfo
+}
+
+func (f *fakeSharedLister) StorageInfos() framework.StorageInfoLister {
+	return nil
 }
 
 func (f *fakeSharedLister) NodeInfos() framework.NodeInfoLister {

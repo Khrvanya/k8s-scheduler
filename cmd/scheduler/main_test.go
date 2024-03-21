@@ -19,9 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,68 +27,69 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
 
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app"
 	"k8s.io/kubernetes/cmd/kube-scheduler/app/options"
-	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
-	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling"
-	"sigs.k8s.io/scheduler-plugins/pkg/networktraffic"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesources"
-	"sigs.k8s.io/scheduler-plugins/pkg/qos"
-	"sigs.k8s.io/scheduler-plugins/pkg/trimaran/targetloadpacking"
 )
 
 func TestSetup(t *testing.T) {
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "manifests", "crds"),
+		},
+	}
+
+	// start envtest cluster
+	cfg, err := testEnv.Start()
+	defer testEnv.Stop()
+	if err != nil {
+		panic(err)
+	}
+
 	// temp dir
-	tmpDir, err := ioutil.TempDir("", "scheduler-options")
+	tmpDir, err := os.MkdirTemp("", "scheduler-options")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// https server
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		w.Write([]byte(`{"metadata": {"name": "test"}}`))
-	}))
-	defer server.Close()
+	clusters := make(map[string]*clientcmdapi.Cluster)
+	clusters["default-cluster"] = &clientcmdapi.Cluster{
+		Server:                   cfg.Host,
+		CertificateAuthorityData: cfg.CAData,
+	}
+	// https://github.com/kubernetes-sigs/controller-runtime/blob/v0.16.3/examples/scratch-env/main.go
+	user, err := testEnv.ControlPlane.AddUser(envtest.User{
+		Name:   "envtest-admin",
+		Groups: []string{"system:masters"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kubeConfig, err := user.KubeConfig()
+	if err != nil {
+		t.Fatalf("unable to create kubeconfig: %v", err)
+	}
 
 	configKubeconfig := filepath.Join(tmpDir, "config.kubeconfig")
-	if err := ioutil.WriteFile(configKubeconfig, []byte(fmt.Sprintf(`
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    insecure-skip-tls-verify: true
-    server: %s
-  name: default
-contexts:
-- context:
-    cluster: default
-    user: default
-  name: default
-current-context: default
-users:
-- name: default
-  user:
-    username: config
-`, server.URL)), os.FileMode(0600)); err != nil {
-		t.Fatal(err)
+	if err := os.WriteFile(configKubeconfig, kubeConfig, os.FileMode(0600)); err != nil {
+		t.Fatalf("unable to create kubeconfig file: %v", err)
 	}
 
 	// PodState plugin config
 	podStateConfigFile := filepath.Join(tmpDir, "podState.yaml")
-	if err := ioutil.WriteFile(podStateConfigFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(podStateConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
 profiles:
 - plugins:
-    queueSort:
-      disabled:
-      - name: "*"
     preFilter:
       disabled:
       - name: "*"
@@ -111,8 +110,8 @@ profiles:
 
 	// QOSSort plugin config
 	qosSortConfigFile := filepath.Join(tmpDir, "qosSort.yaml")
-	if err := ioutil.WriteFile(qosSortConfigFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(qosSortConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -141,145 +140,40 @@ profiles:
 
 	// Coscheduling plugin config
 	coschedulingConfigFile := filepath.Join(tmpDir, "coscheduling.yaml")
-	if err := ioutil.WriteFile(coschedulingConfigFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(coschedulingConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
 profiles:
 - plugins:
+    multiPoint:
+      enabled:
+      - name: Coscheduling
     queueSort:
-      enabled:
-      - name: Coscheduling
       disabled:
-      - name: "*"
-    preFilter:
-      enabled:
-      - name: Coscheduling
-      disabled:
-      - name: "*"
+      - name: PrioritySort
     filter:
+      disabled:
+      - name: "*"
+    score:
       disabled:
       - name: "*"
     preScore:
       disabled:
       - name: "*"
-    score:
-      disabled:
-      - name: "*"
-    permit:
-      enabled:
-      - name: Coscheduling
-    reserve:
-      enabled:
-      - name: Coscheduling
-    postBind:
-      enabled:
-      - name: Coscheduling
   pluginConfig:
   - name: Coscheduling
     args:
       permitWaitingTimeSeconds: 10
-      kubeConfigPath: "%s"
-`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
-		t.Fatal(err)
-	}
-
-	// Coscheduling plugin config with arguments
-	coschedulingConfigWithArgsFile := filepath.Join(tmpDir, "coscheduling-with-args.yaml")
-	if err := ioutil.WriteFile(coschedulingConfigWithArgsFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
-kind: KubeSchedulerConfiguration
-clientConnection:
-  kubeconfig: "%s"
-profiles:
-- plugins:
-    queueSort:
-      enabled:
-      - name: Coscheduling
-      disabled:
-      - name: "*"
-    preFilter:
-      enabled:
-      - name: Coscheduling
-      disabled:
-      - name: "*"
-    filter:
-      disabled:
-      - name: "*"
-    postFilter:
-      enabled:
-      - name: Coscheduling
-    preScore:
-      disabled:
-      - name: "*"
-    score:
-      disabled:
-      - name: "*"
-    permit:
-      enabled:
-      - name: Coscheduling
-    reserve:
-      enabled:
-      - name: Coscheduling
-    postBind:
-      enabled:
-      - name: Coscheduling
-  pluginConfig:
-  - name: Coscheduling
-    args:
-      permitWaitingTimeSeconds: 10
-      kubeConfigPath: "%s"
-`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
-		t.Fatal(err)
-	}
-
-	// NodeResourcesAllocatable plugin config
-	nodeResourcesAllocatableConfigFile := filepath.Join(tmpDir, "nodeResourcesAllocatable.yaml")
-	if err := ioutil.WriteFile(nodeResourcesAllocatableConfigFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
-kind: KubeSchedulerConfiguration
-clientConnection:
-  kubeconfig: "%s"
-profiles:
-- plugins:
-    score:
-      enabled:
-      - name: NodeResourcesAllocatable
-      disabled:
-      - name: "*"
-`, configKubeconfig)), os.FileMode(0600)); err != nil {
-		t.Fatal(err)
-	}
-
-	networkTrafficConfigFileWithArgs := filepath.Join(tmpDir, "networkTraffic.yaml")
-	if err := ioutil.WriteFile(networkTrafficConfigFileWithArgs, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
-kind: KubeSchedulerConfiguration
-clientConnection:
-  kubeconfig: "%s"
-profiles:
-- schedulerName: default-scheduler
-  plugins:
-    score:
-      enabled:
-      - name: NetworkTraffic
-      disabled:
-      - name: "*"
-  pluginConfig:
-  - name: NetworkTraffic
-    args:
-      prometheusAddress: "prometheus-1616380099-server"
-      networkInterface: "ens192"
-      timeRangeInMinutes: 3
 `, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
 
 	// NodeResourcesAllocatable plugin config with arguments
 	nodeResourcesAllocatableConfigWithArgsFile := filepath.Join(tmpDir, "nodeResourcesAllocatable-with-args.yaml")
-	if err := ioutil.WriteFile(nodeResourcesAllocatableConfigWithArgsFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(nodeResourcesAllocatableConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -304,9 +198,9 @@ profiles:
 	}
 
 	// CapacityScheduling plugin config with arguments
-	capacitySchedulingConfigWithArgsFile := filepath.Join(tmpDir, "capacityScheduling-with-args.yaml")
-	if err := ioutil.WriteFile(capacitySchedulingConfigWithArgsFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	capacitySchedulingConfigv1beta3 := filepath.Join(tmpDir, "capacityScheduling-v1beta3.yaml")
+	if err := os.WriteFile(capacitySchedulingConfigv1beta3, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -324,18 +218,37 @@ profiles:
     reserve:
       enabled:
       - name: CapacityScheduling
-  pluginConfig:
-  - name: CapacityScheduling
-    args:
-      kubeConfigPath: "%s"
-`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+	capacitySchedulingConfigv1 := filepath.Join(tmpDir, "capacityScheduling-v1.yaml")
+	if err := os.WriteFile(capacitySchedulingConfigv1, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    preFilter:
+      enabled:
+      - name: CapacityScheduling
+    postFilter:
+      enabled:
+      - name: CapacityScheduling
+      disabled:
+      - name: "*"
+    reserve:
+      enabled:
+      - name: CapacityScheduling
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
 
 	// TargetLoadPacking plugin config with arguments
 	targetLoadPackingConfigWithArgsFile := filepath.Join(tmpDir, "targetLoadPacking-with-args.yaml")
-	if err := ioutil.WriteFile(targetLoadPackingConfigWithArgsFile, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(targetLoadPackingConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -358,10 +271,180 @@ profiles:
 		t.Fatal(err)
 	}
 
+	// TargetLoadPacking plugin config with Prometheus Metric Provider arguments
+	targetLoadPackingConfigWithPrometheusArgsFile := filepath.Join(tmpDir, "targetLoadPacking-with-prometheus-args.yaml")
+	if err := os.WriteFile(targetLoadPackingConfigWithPrometheusArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    score:
+      enabled:
+      - name: TargetLoadPacking
+      disabled:
+      - name: "*"
+  pluginConfig:
+  - name: TargetLoadPacking
+    args:
+      metricProvider:
+        type: Prometheus
+        address: http://prometheus-k8s.monitoring.svc.cluster.local:9090
+        insecureSkipVerify: false
+      targetUtilization: 60 
+      defaultRequests:
+        cpu: "1000m"
+      defaultRequestsMultiplier: "1.8"
+      watcherAddress: http://deadbeef:2020
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// LoadVariationRiskBalancing plugin config with arguments
+	loadVariationRiskBalancingConfigWithArgsFile := filepath.Join(tmpDir, "loadVariationRiskBalancing-with-args.yaml")
+	if err := os.WriteFile(loadVariationRiskBalancingConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    score:
+      enabled:
+      - name: LoadVariationRiskBalancing
+      disabled:
+      - name: "*"
+  pluginConfig:
+  - name: LoadVariationRiskBalancing
+    args:
+      metricProvider:
+        type: Prometheus
+        address: http://prometheus-k8s.monitoring.svc.cluster.local:9090
+      safeVarianceMargin: 1
+      safeVarianceSensitivity: 2.5
+      watcherAddress: http://deadbeef:2020
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// LowRiskOverCommitment plugin config with arguments
+	lowRiskOverCommitmentConfigWithArgsFile := filepath.Join(tmpDir, "lowRiskOverCommitment-with-args.yaml")
+	if err := os.WriteFile(lowRiskOverCommitmentConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    preScore:
+      enabled:
+      - name: LowRiskOverCommitment
+      disabled:
+      - name: "*"
+    score:
+      enabled:
+      - name: LowRiskOverCommitment
+      disabled:
+      - name: "*"
+  pluginConfig:
+  - name: LowRiskOverCommitment
+    args:
+      metricProvider:
+        type: Prometheus
+        address: http://prometheus-k8s.monitoring.svc.cluster.local:9090
+      smoothingWindowSize: 5
+      riskLimitWeights:
+        cpu: 0.5
+        memory: 0.5
+      watcherAddress: http://deadbeef:2020
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// NodeResourceTopologyMatch plugin config
+	nodeResourceTopologyMatchConfigWithArgsFile := filepath.Join(tmpDir, "nodeResourceTopologyMatch.yaml")
+	if err := os.WriteFile(nodeResourceTopologyMatchConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    filter:
+      enabled:
+      - name: NodeResourceTopologyMatch
+      disabled:
+      - name: "*"
+    score:
+      enabled:
+      - name: NodeResourceTopologyMatch
+      disabled:
+      - name: "*"
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// topologicalSort plugin config
+	topologicalSortConfigFile := filepath.Join(tmpDir, "topologicalSort.yaml")
+	if err := os.WriteFile(topologicalSortConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    queueSort:
+      enabled:
+      - name: TopologicalSort
+      disabled:
+      - name: "*"
+    preFilter:
+      disabled:
+      - name: "*"
+    filter:
+      disabled:
+      - name: "*"
+    preScore:
+      disabled:
+      - name: "*"
+    score:
+      disabled:
+      - name: "*"
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// networkOverhead plugin config
+	networkOverheadConfigWithArgsFile := filepath.Join(tmpDir, "networkOverhead.yaml")
+	if err := os.WriteFile(networkOverheadConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    preFilter:
+      enabled:
+      - name: NetworkOverhead
+    filter:
+      enabled:
+      - name: NetworkOverhead
+      disabled:
+      - name: "*"
+    score:
+      enabled:
+      - name: NetworkOverhead
+      disabled:
+      - name: "*"
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
 	// multiple profiles config
 	multiProfilesConfig := filepath.Join(tmpDir, "multi-profiles.yaml")
-	if err := ioutil.WriteFile(multiProfilesConfig, []byte(fmt.Sprintf(`
-apiVersion: kubescheduler.config.k8s.io/v1beta1
+	if err := os.WriteFile(multiProfilesConfig, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: "%s"
@@ -388,191 +471,37 @@ profiles:
 		t.Fatal(err)
 	}
 
-	defaultPlugins := map[string][]kubeschedulerconfig.Plugin{
-		"QueueSortPlugin": {
-			{Name: "PrioritySort"},
-		},
-		"PreFilterPlugin": {
-			{Name: "NodeResourcesFit"},
-			{Name: "NodePorts"},
-			{Name: "PodTopologySpread"},
-			{Name: "InterPodAffinity"},
-			{Name: "VolumeBinding"},
-		},
-		"FilterPlugin": {
-			{Name: "NodeUnschedulable"},
-			{Name: "NodeResourcesFit"},
-			{Name: "NodeName"},
-			{Name: "NodePorts"},
-			{Name: "NodeAffinity"},
-			{Name: "VolumeRestrictions"},
-			{Name: "TaintToleration"},
-			{Name: "EBSLimits"},
-			{Name: "GCEPDLimits"},
-			{Name: "NodeVolumeLimits"},
-			{Name: "AzureDiskLimits"},
-			{Name: "VolumeBinding"},
-			{Name: "VolumeZone"},
-			{Name: "PodTopologySpread"},
-			{Name: "InterPodAffinity"},
-		},
-		"PostFilterPlugin": {
-			{Name: "DefaultPreemption"},
-		},
-		"PreScorePlugin": {
-			{Name: "InterPodAffinity"},
-			{Name: "PodTopologySpread"},
-			{Name: "TaintToleration"},
-			{Name: "SelectorSpread"},
-		},
-		"ScorePlugin": {
-			{Name: "NodeResourcesBalancedAllocation", Weight: 1},
-			{Name: "ImageLocality", Weight: 1},
-			{Name: "InterPodAffinity", Weight: 1},
-			{Name: "NodeResourcesLeastAllocated", Weight: 1},
-			{Name: "NodeAffinity", Weight: 1},
-			{Name: "NodePreferAvoidPods", Weight: 10000},
-			{Name: "PodTopologySpread", Weight: 2},
-			{Name: "TaintToleration", Weight: 1},
-			{Name: "SelectorSpread", Weight: 1},
-		},
-		"BindPlugin":    {{Name: "DefaultBinder"}},
-		"ReservePlugin": {{Name: "VolumeBinding"}},
-		"PreBindPlugin": {{Name: "VolumeBinding"}},
-	}
-
 	testcases := []struct {
 		name            string
 		flags           []string
 		registryOptions []app.Option
-		wantPlugins     map[string]map[string][]kubeschedulerconfig.Plugin
+		wantPlugins     map[string]*config.Plugins
 	}{
 		{
 			name: "default config",
 			flags: []string{
 				"--kubeconfig", configKubeconfig,
 			},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": defaultPlugins,
-			},
-		},
-		{
-			name:            "single profile config - QOSSort",
-			flags:           []string{"--config", qosSortConfigFile},
-			registryOptions: []app.Option{app.WithPlugin(qos.Name, qos.New)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"QueueSortPlugin":  {{Name: "QOSSort"}},
-					"ReservePlugin":    {{Name: "VolumeBinding"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-				},
-			},
-		},
-		{
-			name:            "single profile config - Coscheduling",
-			flags:           []string{"--config", coschedulingConfigFile},
-			registryOptions: []app.Option{app.WithPlugin(coscheduling.Name, coscheduling.New)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"PreFilterPlugin":  {{Name: "Coscheduling"}},
-					"PostBindPlugin":   {{Name: "Coscheduling"}},
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"QueueSortPlugin":  {{Name: "Coscheduling"}},
-					"ReservePlugin":    {{Name: "VolumeBinding"}, {Name: "Coscheduling"}},
-					"PermitPlugin":     {{Name: "Coscheduling"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-				},
-			},
-		},
-		{
-			name:            "single profile config - Coscheduling with args",
-			flags:           []string{"--config", coschedulingConfigWithArgsFile},
-			registryOptions: []app.Option{app.WithPlugin(coscheduling.Name, coscheduling.New)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"PreFilterPlugin":  {{Name: "Coscheduling"}},
-					"PostBindPlugin":   {{Name: "Coscheduling"}},
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}, {Name: "Coscheduling"}},
-					"QueueSortPlugin":  {{Name: "Coscheduling"}},
-					"ReservePlugin":    {{Name: "VolumeBinding"}, {Name: "Coscheduling"}},
-					"PermitPlugin":     {{Name: "Coscheduling"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-				},
-			},
-		},
-		{
-			name:            "single profile config - Node Resources Allocatable",
-			flags:           []string{"--config", nodeResourcesAllocatableConfigFile},
-			registryOptions: []app.Option{app.WithPlugin(noderesources.AllocatableName, noderesources.NewAllocatable)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"FilterPlugin":     defaultPlugins["FilterPlugin"],
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
-					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
-					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
-					"ReservePlugin":    {{Name: "VolumeBinding"}},
-					"ScorePlugin":      {{Name: "NodeResourcesAllocatable", Weight: 1}},
-				},
+			wantPlugins: map[string]*config.Plugins{
+				"default-scheduler": defaults.ExpandedPluginsV1,
 			},
 		},
 		{
 			name:            "single profile config - Node Resources Allocatable with args",
 			flags:           []string{"--config", nodeResourcesAllocatableConfigWithArgsFile},
 			registryOptions: []app.Option{app.WithPlugin(noderesources.AllocatableName, noderesources.NewAllocatable)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
+			wantPlugins: map[string]*config.Plugins{
 				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"FilterPlugin":     defaultPlugins["FilterPlugin"],
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
-					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
-					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
-					"ReservePlugin":    {{Name: "VolumeBinding"}},
-					"ScorePlugin":      {{Name: "NodeResourcesAllocatable", Weight: 1}},
-				},
-			},
-		},
-		{
-			name:            "single profile config - Network Traffic with args",
-			flags:           []string{"--config", networkTrafficConfigFileWithArgs},
-			registryOptions: []app.Option{app.WithPlugin(networktraffic.Name, networktraffic.New)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"FilterPlugin":     defaultPlugins["FilterPlugin"],
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
-					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
-					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
-					"ReservePlugin":    {{Name: "VolumeBinding"}},
-					"ScorePlugin":      {{Name: "NetworkTraffic", Weight: 1}},
-				},
-			},
-		},
-		{
-			name:            "single profile config - TargetLoadPacking with args",
-			flags:           []string{"--config", targetLoadPackingConfigWithArgsFile},
-			registryOptions: []app.Option{app.WithPlugin(targetloadpacking.Name, targetloadpacking.New)},
-			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
-				"default-scheduler": {
-					"BindPlugin":       {{Name: "DefaultBinder"}},
-					"FilterPlugin":     defaultPlugins["FilterPlugin"],
-					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
-					"PreBindPlugin":    {{Name: "VolumeBinding"}},
-					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
-					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
-					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
-					"ReservePlugin":    {{Name: "VolumeBinding"}},
-					"ScorePlugin":      {{Name: targetloadpacking.Name, Weight: 1}},
+					PreEnqueue: defaults.ExpandedPluginsV1.PreEnqueue,
+					QueueSort:  defaults.ExpandedPluginsV1.QueueSort,
+					Bind:       defaults.ExpandedPluginsV1.Bind,
+					PreFilter:  defaults.ExpandedPluginsV1.PreFilter,
+					Filter:     defaults.ExpandedPluginsV1.Filter,
+					PostFilter: defaults.ExpandedPluginsV1.PostFilter,
+					PreScore:   defaults.ExpandedPluginsV1.PreScore,
+					Score:      config.PluginSet{Enabled: []config.Plugin{{Name: noderesources.AllocatableName, Weight: 1}}},
+					Reserve:    defaults.ExpandedPluginsV1.Reserve,
+					PreBind:    defaults.ExpandedPluginsV1.PreBind,
 				},
 			},
 		},
@@ -581,30 +510,40 @@ profiles:
 		// https://github.com/kubernetes/kubernetes/blob/master/cmd/kube-scheduler/app/server_test.go
 	}
 
+	makeListener := func(t *testing.T) net.Listener {
+		t.Helper()
+		l, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := pflag.NewFlagSet("test", pflag.PanicOnError)
-			opts, err := options.NewOptions()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, f := range opts.Flags().FlagSets {
+			opts := options.NewOptions()
+
+			nfs := opts.Flags
+			for _, f := range nfs.FlagSets {
 				fs.AddFlagSet(f)
 			}
 			if err := fs.Parse(tc.flags); err != nil {
 				t.Fatal(err)
 			}
 
+			// use listeners instead of static ports so parallel test runs don't conflict
+			opts.SecureServing.Listener = makeListener(t)
+			defer opts.SecureServing.Listener.Close()
+
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			cc, sched, err := app.Setup(ctx, opts, tc.registryOptions...)
+			_, sched, err := app.Setup(ctx, opts, tc.registryOptions...)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer cc.SecureServing.Listener.Close()
-			defer cc.InsecureServing.Listener.Close()
 
-			gotPlugins := make(map[string]map[string][]kubeschedulerconfig.Plugin)
+			gotPlugins := make(map[string]*config.Plugins)
 			for n, p := range sched.Profiles {
 				gotPlugins[n] = p.ListPlugins()
 			}
