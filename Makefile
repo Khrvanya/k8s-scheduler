@@ -16,7 +16,7 @@ ARCHS = amd64 arm64
 COMMONENVVAR=GOOS=$(shell uname -s | tr A-Z a-z)
 BUILDENVVAR=CGO_ENABLED=0
 
-RELEASE_VERSION="v1.0.6"
+RELEASE_VERSION="v1.0.7"
 
 LOCAL_REGISTRY=us-docker.pkg.dev/saas-test-omfe/k8s-scheduler
 LOCAL_IMAGE=kube-scheduler:${RELEASE_VERSION}

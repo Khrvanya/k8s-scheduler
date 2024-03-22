@@ -19,22 +19,19 @@ package util
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	"sigs.k8s.io/scheduler-plugins/pkg/apis/scheduling/v1alpha1"
+	"sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
 
 func PrintPods(t *testing.T, cs clientset.Interface, ns string) {
@@ -88,58 +85,20 @@ func MakePG(name, namespace string, min int32, creationTime *time.Time, minResou
 		pg.CreationTimestamp = metav1.Time{Time: *creationTime}
 	}
 	if minResource != nil {
-		pg.Spec.MinResources = minResource
+		pg.Spec.MinResources = *minResource
 	}
 	return pg
 }
 
-func createKubeConfig(clientCfg *restclient.Config) *clientcmdapi.Config {
-	clusterNick := "cluster"
-	userNick := "user"
-	contextNick := "context"
-
-	configCmd := clientcmdapi.NewConfig()
-
-	credentials := clientcmdapi.NewAuthInfo()
-	credentials.Token = clientCfg.BearerToken
-	credentials.TokenFile = clientCfg.BearerTokenFile
-	credentials.ClientCertificate = clientCfg.TLSClientConfig.CertFile
-	if len(credentials.ClientCertificate) == 0 {
-		credentials.ClientCertificateData = clientCfg.TLSClientConfig.CertData
+func UpdatePGStatus(pg *v1alpha1.PodGroup, phase v1alpha1.PodGroupPhase, occupiedBy string, scheduled int32, running int32, succeeded int32, failed int32) *v1alpha1.PodGroup {
+	pg.Status = v1alpha1.PodGroupStatus{
+		Phase:      phase,
+		OccupiedBy: occupiedBy,
+		Running:    running,
+		Succeeded:  succeeded,
+		Failed:     failed,
 	}
-	credentials.ClientKey = clientCfg.TLSClientConfig.KeyFile
-	if len(credentials.ClientKey) == 0 {
-		credentials.ClientKeyData = clientCfg.TLSClientConfig.KeyData
-	}
-	configCmd.AuthInfos[userNick] = credentials
-
-	cluster := clientcmdapi.NewCluster()
-	cluster.Server = clientCfg.Host
-	cluster.CertificateAuthority = clientCfg.CAFile
-	if len(cluster.CertificateAuthority) == 0 {
-		cluster.CertificateAuthorityData = clientCfg.CAData
-	}
-	cluster.InsecureSkipTLSVerify = clientCfg.Insecure
-	configCmd.Clusters[clusterNick] = cluster
-
-	context := clientcmdapi.NewContext()
-	context.Cluster = clusterNick
-	context.AuthInfo = userNick
-	configCmd.Contexts[contextNick] = context
-	configCmd.CurrentContext = contextNick
-
-	return configCmd
-}
-
-func BuildKubeConfigFile(config *restclient.Config) string {
-	kubeConfigPath := ""
-	if tempFile, err := ioutil.TempFile(os.TempDir(), "kubeconfig-"); err == nil {
-		kubeConfig := createKubeConfig(config)
-		clientcmd.WriteToFile(*kubeConfig, tempFile.Name())
-		kubeConfigPath = tempFile.Name()
-		return kubeConfigPath
-	}
-	return ""
+	return pg
 }
 
 func MakePod(podName string, namespace string, memReq int64, cpuReq int64, priority int32, uid string, nodeName string) *corev1.Pod {
@@ -153,4 +112,72 @@ func MakePod(podName string, namespace string, memReq int64, cpuReq int64, prior
 		},
 	}
 	return pod
+}
+
+// PodNotExist returns true if the given pod does not exist.
+func PodNotExist(cs clientset.Interface, podNamespace, podName string) bool {
+	_, err := cs.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	return errors.IsNotFound(err)
+}
+
+// WithLimits adds a new app or init container to the inner pod with a given resource map.
+func WithLimits(p *st.PodWrapper, resMap map[string]string, initContainer bool) *st.PodWrapper {
+	if len(resMap) == 0 {
+		return p
+	}
+
+	containers, cntName := findContainerList(p, initContainer)
+
+	*containers = append(*containers, corev1.Container{
+		Name:  fmt.Sprintf("%s-%d", cntName, len(*containers)+1),
+		Image: imageutils.GetPauseImageName(),
+		Resources: corev1.ResourceRequirements{
+			Limits: makeResListMap(resMap),
+		},
+	})
+
+	return p
+}
+
+// WithRequests adds a new app or init container to the inner pod with a given resource map.
+func WithRequests(p *st.PodWrapper, resMap map[string]string, initContainer bool) *st.PodWrapper {
+	if len(resMap) == 0 {
+		return p
+	}
+
+	containers, cntName := findContainerList(p, initContainer)
+
+	*containers = append(*containers, corev1.Container{
+		Name:  fmt.Sprintf("%s-%d", cntName, len(*containers)+1),
+		Image: imageutils.GetPauseImageName(),
+		Resources: corev1.ResourceRequirements{
+			Requests: makeResListMap(resMap),
+		},
+	})
+
+	return p
+}
+
+func findContainerList(p *st.PodWrapper, initContainer bool) (*[]corev1.Container, string) {
+	if initContainer {
+		return &p.Obj().Spec.InitContainers, "initcnt"
+	}
+	return &p.Obj().Spec.Containers, "cnt"
+}
+
+func makeResListMap(resMap map[string]string) corev1.ResourceList {
+	res := corev1.ResourceList{}
+	for k, v := range resMap {
+		res[corev1.ResourceName(k)] = resource.MustParse(v)
+	}
+	return res
+}
+
+func MustNewPodInfo(t testing.TB, pod *corev1.Pod) *framework.PodInfo {
+	podInfo, err := framework.NewPodInfo(pod)
+	if err != nil {
+		t.Fatalf("expected err to be nil got: %v", err)
+	}
+
+	return podInfo
 }

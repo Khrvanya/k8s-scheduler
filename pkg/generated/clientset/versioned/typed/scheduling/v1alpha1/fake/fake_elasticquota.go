@@ -27,7 +27,7 @@ import (
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testing "k8s.io/client-go/testing"
-	v1alpha1 "sigs.k8s.io/scheduler-plugins/pkg/apis/scheduling/v1alpha1"
+	v1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
 
 // FakeElasticQuotas implements ElasticQuotaInterface
@@ -36,9 +36,9 @@ type FakeElasticQuotas struct {
 	ns   string
 }
 
-var elasticquotasResource = schema.GroupVersionResource{Group: "scheduling.sigs.k8s.io", Version: "v1alpha1", Resource: "elasticquotas"}
+var elasticquotasResource = schema.GroupVersionResource{Group: "scheduling.x-k8s.io", Version: "v1alpha1", Resource: "elasticquotas"}
 
-var elasticquotasKind = schema.GroupVersionKind{Group: "scheduling.sigs.k8s.io", Version: "v1alpha1", Kind: "ElasticQuota"}
+var elasticquotasKind = schema.GroupVersionKind{Group: "scheduling.x-k8s.io", Version: "v1alpha1", Kind: "ElasticQuota"}
 
 // Get takes name of the elasticQuota, and returns the corresponding elasticQuota object, and an error if there is any.
 func (c *FakeElasticQuotas) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.ElasticQuota, err error) {
@@ -102,10 +102,22 @@ func (c *FakeElasticQuotas) Update(ctx context.Context, elasticQuota *v1alpha1.E
 	return obj.(*v1alpha1.ElasticQuota), err
 }
 
+// UpdateStatus was generated because the type contains a Status member.
+// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
+func (c *FakeElasticQuotas) UpdateStatus(ctx context.Context, elasticQuota *v1alpha1.ElasticQuota, opts v1.UpdateOptions) (*v1alpha1.ElasticQuota, error) {
+	obj, err := c.Fake.
+		Invokes(testing.NewUpdateSubresourceAction(elasticquotasResource, "status", c.ns, elasticQuota), &v1alpha1.ElasticQuota{})
+
+	if obj == nil {
+		return nil, err
+	}
+	return obj.(*v1alpha1.ElasticQuota), err
+}
+
 // Delete takes name of the elasticQuota and deletes it. Returns an error if one occurs.
 func (c *FakeElasticQuotas) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(elasticquotasResource, c.ns, name), &v1alpha1.ElasticQuota{})
+		Invokes(testing.NewDeleteActionWithOptions(elasticquotasResource, c.ns, name, opts), &v1alpha1.ElasticQuota{})
 
 	return err
 }

@@ -23,7 +23,7 @@ import (
 
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
-	v1alpha1 "sigs.k8s.io/scheduler-plugins/pkg/apis/scheduling/v1alpha1"
+	v1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
 
 // GenericInformer is type of SharedIndexInformer which will locate and delegate to other
@@ -52,7 +52,7 @@ func (f *genericInformer) Lister() cache.GenericLister {
 // TODO extend this to unknown resources with a client pool
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
-	// Group=scheduling.sigs.k8s.io, Version=v1alpha1
+	// Group=scheduling.x-k8s.io, Version=v1alpha1
 	case v1alpha1.SchemeGroupVersion.WithResource("elasticquotas"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Scheduling().V1alpha1().ElasticQuotas().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("podgroups"):
